@@ -73,17 +73,21 @@ python scripts/wb_mouse_checkin.py -calibrate
 
 ## 关键实现要点（避免重踩坑）
 
-1. **所有 Win32 调用必须显式声明 `argtypes`**，`HWND` 按 `c_void_p`（64 位指针）传。不声明会被 ctypes 默认按 32 位 `c_int` 截断，导致 `SetForegroundWindow` 静默失败——表现为「窗口没置顶、点击打空」。本脚本已统一声明。
-2. **可靠置前三步**：最小化先 `ShowWindow(SW_RESTORE)` → `AttachThreadInput` 线程绑定绕过系统前台锁 → `SetWindowPos(HWND_TOP)` 置顶 z 序。
-3. **坐标用「相对客户区左下角」**（x=距左, y=距底），窗口任意缩放都命中，校准一次永久复用。
-4. **校验用「近黑像素数」而非白字数**：灰底「今日已领」按钮也含白字，不能靠白字判定；黑底「立即领取」有大量近黑像素（r,g,b<70），灰按钮近黑像素≈0。用此区分，主题无关。
-5. **截图优先 desktop-control-win 的 `screen-info.ps1`**（若存在），否则回退 `PrintWindow` 客户区截图；`PNG` 编解码全用标准库手写（支持所有 filter），无外部依赖。
+1. **所有 Win32 调用必须显式声明 `argtypes`**，`HWND` 按 `c_void_p`（64 位指针）传，回调签名用 `WINFUNCTYPE(BOOL, HWND, c_void_p)`。不声明会被 ctypes 默认按 32 位 `c_int` 截断，导致 `SetForegroundWindow`/`EnumWindows` 静默失败——表现为「窗口没置顶、点击打空」。
+2. **可靠置前 = 解决"窗口不在前台"**：最小化先 `ShowWindow(SW_RESTORE)`（恢复后验证 `GetWindowRect` 已脱离 -32000 幽灵坐标，最多重试 3 次）→ `AttachThreadInput` 线程绑定绕过系统前台锁 → `SetForegroundWindow`。**不要用 `SetWindowPos(HWND_TOP)` 钉死窗口位置**——WorkBuddy 会主动把它移回原位置/改尺寸（实测移到 (831,411) 之类），反而导致坐标全乱。
+3. **窗口枚举必须精确匹配标题**：本机可能同时存在「WorkBuddy」(主窗口) 与「WorkBuddy - 个人中心 - xxx」等子窗口。`if TARGET_TITLE in buf.value` 子串匹配会命中 z 序最前的子窗口（可能是最小化/未显示的幽灵窗口）→ 所有点击打空。修复：`if title == TARGET_TITLE` 精确匹配优先，找不到再兜底子串匹配。
+4. **坐标原点用 `GetWindowRect` 的 left/top，不用 `ClientToScreen`**：实测点击头像弹出菜单后 `ClientToScreen` 返回 2× 错误值（`GetWindowRect` 正常 (619,169) 时它返回 (1238,338)），导致全部坐标翻倍打空——这是 2026-08-04 的**真正根因**。WorkBuddy 是无边框窗口（`Chrome_WidgetWin_1`，客户区 = 整个窗口），客户区原点 = 窗口左上角，用 `GetWindowRect` 永远稳定。**窗口被移去哪坐标就跟随到哪，天然免疫"窗口不在前台/被移动"**，根本不需要钉窗。
+5. **脚本开头设置 DPI 感知**：`SetProcessDpiAwareness(2)`（per-monitor DPI aware），失败则回退 `SetProcessDPIAware()`。避免 Windows DPI 虚拟化导致 GetWindowRect/SetCursorPos 坐标系不一致（备用保险）。
+6. **坐标用「相对客户区左下角」**（x=距左, y=距底），窗口任意缩放都命中，校准一次永久复用。
+7. **校验用「近黑像素数」而非白字数**：灰底「今日已领」按钮也含白字，不能靠白字判定；黑底「立即领取」有大量近黑像素（r,g,b<70），灰按钮近黑像素≈0。用此区分，主题无关。
+8. **中段校验防假阳性（必须保留）**：点完「Buddy 加油站」后先截图，`verify_claimed` 要求按钮位置是**黑像素**（`unclaimed`，即面板已打开、黑底「立即领取」按钮存在）才继续点领取。否则若面板没打开，最终截图是 WorkBuddy 主界面，`verify_claimed` 会在按钮位置采样到主界面灰色背景误判 `claimed` → 假阳性签到成功。
+9. **截图优先 desktop-control-win 的 `screen-info.ps1`**（若存在），否则回退 `PrintWindow` 客户区截图；`PNG` 编解码全用标准库手写（支持所有 filter），无外部依赖。
 
 ## 配置定时任务（示例）
 
 在 WorkBuddy 自动化里建一个每日任务，prompt 大致为：
 
-> 运行 `python scripts/wb_mouse_checkin.py -run`（脚本内置窗口置前与灰度校验）。
+> 运行 `python scripts/wb_mouse_checkin.py -run`（脚本内置：窗口精确匹配 + 最小化恢复置前 + 固定坐标点击 + 中段校验面板是否打开 + 灰度校验是否已领）。
 > 读 `checkin_result.png` 确认结果：灰色「今日已领」=完成；黑底「立即领取」仍在=失败。
 > 按你的通知偏好（微信/钉钉等）把结果发给本人。**通知目标和通道由你自己的配置决定，本 skill 不内置任何推送。**
 
