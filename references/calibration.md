@@ -88,6 +88,6 @@ python scripts/wb_mouse_checkin.py -run
 ## 常见问题
 
 - **只会点头像 / 后续点击打空**：没校准，用的是默认示例坐标。先 `-calibrate` 交互记录三个点。
-- **点击打空 / 窗口没被置前**：Win32 调用未声明 `argtypes` 导致 HWND 被截断的典型症状，本脚本已修复（所有 `user32`/`gdi32`/`kernel32` 调用都显式声明签名）。若仍无效，确认 WorkBuddy 未被最小化到托盘且未被其他全屏窗口遮挡。
+- **点击打空 / 窗口没被置前**：① 脚本枚举到的是否主窗口？精确标题 `WorkBuddy`（排除 `WorkBuddy - xxx` 子窗口，旧版子串匹配会误选 z 序最前的子窗口导致全打空，已修复）；② 坐标原点是否用 `GetWindowRect`？（`ClientToScreen` 被 WorkBuddy 弹出菜单干扰会返回 2× 错误值，已修复）。若仍无效，确认 WorkBuddy 未被最小化到托盘且未被其他全屏窗口遮挡。
 - **暗色主题误判**：校验用「近黑像素数」而非白字数（灰底「今日已领」也含白字），主题无关，亮/暗色都正确。
 - **截图失败**：优先用 desktop-control-win 的 `screen-info.ps1`；若未安装该 skill，自动回退到 `PrintWindow` 客户区截图。两者都失败则签到仍会执行但无法自动校验（退出码 2）。
