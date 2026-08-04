@@ -24,6 +24,20 @@ if sys.platform != "win32":
     print("ERROR: 本脚本仅支持 Windows (依赖 ctypes.windll / user32 / gdi32)。")
     sys.exit(3)
 
+# ===================== DPI 感知 (2026-08-04 关键修复) =====================
+# 根因: Python 进程默认 DPI-unaware, GetWindowRect/ClientToScreen 返回的是
+# Windows DPI 虚拟化的【逻辑坐标】, 而 SetCursorPos/mouse_event 用的是【物理坐标】,
+# 两者差 2~3 倍缩放(本机实测: 窗口逻辑(619,169) -> 物理(1238,338)/(1857,507)),
+# 导致"打印坐标正确但点击全打在窗口外"。强制 Per-Monitor DPI Aware 后,
+# GetWindowRect 返回物理坐标, 与 SetCursorPos 同一坐标系, 点击精确命中。
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)   # PROCESS_PER_MONITOR_DPI_AWARE
+except Exception:
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()     # 旧系统回退
+    except Exception:
+        pass
+
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
 gdi32 = ctypes.windll.gdi32
@@ -60,7 +74,7 @@ INT   = ctypes.c_int
 UINT  = ctypes.c_uint
 SHORT = ctypes.c_short
 
-user32.EnumWindows.argtypes = [ctypes.WINFUNCTYPE(BOOL, INT, INT), INT]
+user32.EnumWindows.argtypes = [ctypes.WINFUNCTYPE(BOOL, HWND, ctypes.c_void_p), ctypes.c_void_p]
 user32.EnumWindows.restype = BOOL
 user32.GetWindowTextW.argtypes = [HWND, ctypes.c_wchar_p, INT]
 user32.GetWindowTextW.restype = INT
@@ -134,6 +148,9 @@ class BITMAPINFOHEADER(ctypes.Structure):
                 ("biClrUsed", UINT), ("biClrImportant", UINT)]
 
 # ===================== 找 WorkBuddy 主窗口 =====================
+# 坑: WorkBuddy 可能存在多个标题含 "WorkBuddy" 的窗口(如 "WorkBuddy - 个人中心 - 千问" 子窗口)。
+# 子串匹配会命中 z 序最前的子窗口(可能是最小化/未显示的幽灵窗口), 导致所有点击打空。
+# 修复: 精确匹配标题 == "WorkBuddy" 优先, 无精确匹配才回退子串。
 _target = None
 def _callback(hwnd, lparam):
     global _target
@@ -144,12 +161,15 @@ def _callback(hwnd, lparam):
         return True
     buf = ctypes.create_unicode_buffer(length + 1)
     user32.GetWindowTextW(hwnd, buf, length + 1)
-    if TARGET_TITLE in buf.value:
+    title = buf.value.strip()
+    if title == TARGET_TITLE:          # 精确匹配主窗口 -> 立即选中
         _target = hwnd
         return False
+    if _target is None and TARGET_TITLE in title:   # 兜底: 记录第一个子串匹配
+        _target = hwnd
     return True
 
-EnumWindowsProc = ctypes.WINFUNCTYPE(BOOL, INT, INT)
+EnumWindowsProc = ctypes.WINFUNCTYPE(BOOL, HWND, ctypes.c_void_p)
 user32.EnumWindows(EnumWindowsProc(_callback), 0)
 if not _target:
     _target = user32.FindWindowW(None, TARGET_TITLE)
@@ -157,13 +177,12 @@ if not _target:
     print(f"ERROR: 未找到标题含 '{TARGET_TITLE}' 的窗口 (请确认 WorkBuddy 正在运行)")
     sys.exit(3)
 
-wr = RECT(); user32.GetWindowRect(_target, ctypes.byref(wr))
-cr = RECT(); user32.GetClientRect(_target, ctypes.byref(cr))
-o  = POINT(); user32.ClientToScreen(_target, ctypes.byref(o))
-winW = wr.right - wr.left; winH = wr.bottom - wr.top
-cliW = cr.right - cr.left; cliH = cr.bottom - cr.top
-scaleX = winW / cliW if cliW else 1.0
-scaleY = winH / cliH if cliH else 1.0
+# 几何信息(窗口矩形/客户区/DPI/点击坐标)在下面 recompute_geometry() 中统一计算。
+# 关键修复: 若脚本启动时窗口处于最小化(rect=-32000), 必须在 restore 之后**重新**算坐标,
+# 否则头像/加油站/领取坐标会落在 -32000 幽灵位置, 点击全部打空。
+wr = RECT(); cr = RECT(); o = POINT()
+winW = cliW = winH = cliH = 0
+scaleX = scaleY = 1.0
 
 # ===================== 读取校准文件（若存在则覆盖默认坐标） =====================
 # 移植给别人最易踩的坑: 直接 -run 会用下面这组【作者屏幕的示例默认坐标】,
@@ -193,9 +212,33 @@ def conv_bl(x_left, y_bottom):
     vy = cliH - y_bottom           # 距底 -> 距顶(客户区逻辑坐标)
     return int(o.x + vx * scaleX), int(o.y + vy * scaleY)
 
-sa = conv_bl(AVATAR_LEFT, AVATAR_BOTTOM)    # 头像/账户菜单
-sg = conv_bl(GAS_LEFT, GAS_BOTTOM)          # Buddy 加油站
-sc = conv_bl(CLAIM_LEFT, CLAIM_BOTTOM)      # 立即领取按钮
+def recompute_geometry():
+    """重新读取窗口几何并重算所有点击坐标。必须在窗口被 restore 之后调用,
+       否则最小化状态下 rect=-32000 会让坐标算飞。
+
+       2026-08-04 关键修复: 原点 o 不再用 ClientToScreen!
+       实测: 点击头像弹出菜单后 ClientToScreen 返回 2x 错误值
+       (wr=(619,169,1500x1000) 正常, 但 o=(1238,338)), 导致全部坐标翻倍打空。
+       WorkBuddy 是无边框窗口(Chrome_WidgetWin_1), 客户区 = 整个窗口,
+       客户区原点 = 窗口左上角 = GetWindowRect 的 left/top, 稳定可靠。
+       窗口被移去哪坐标就跟随到哪, 天然免疫"窗口不在前台/被移动"。"""
+    global wr, cr, o, winW, winH, cliW, cliH, scaleX, scaleY, sa, sg, sc
+    user32.GetWindowRect(_target, ctypes.byref(wr))
+    user32.GetClientRect(_target, ctypes.byref(cr))
+    o.x = wr.left
+    o.y = wr.top
+    winW = wr.right - wr.left; winH = wr.bottom - wr.top
+    cliW = cr.right - cr.left; cliH = cr.bottom - cr.top
+    scaleX = winW / cliW if cliW else 1.0
+    scaleY = winH / cliH if cliH else 1.0
+    sa = conv_bl(AVATAR_LEFT, AVATAR_BOTTOM)    # 头像/账户菜单
+    sg = conv_bl(GAS_LEFT, GAS_BOTTOM)          # Buddy 加油站
+    sc = conv_bl(CLAIM_LEFT, CLAIM_BOTTOM)      # 立即领取按钮
+    if os.environ.get("WB_DEBUG"):
+        print(f"[DBG-recompute] wr=({wr.left},{wr.top},{winW}x{winH}) o=({o.x},{o.y}) "
+              f"sa={sa} sg={sg} sc={sc}", flush=True)
+
+recompute_geometry()   # 初始计算(若此刻窗口已最小化, do_checkin 的 focus() 会再算一次)
 
 def _print_coords():
     print("== WorkBuddy 窗口信息 ==")
@@ -374,15 +417,89 @@ def verify_claimed(path, sx, sy, radius=22):
         return "claimed"     # 灰按钮 -> 已领
     return "unknown"         # 既不是黑也不是灰 -> 面板可能没正常打开
 
+def find_dark_button(path, step=4):
+    """扫描整图, 动态定位黑底白字按钮(近黑像素最密集的簇中心)。
+       返回图像坐标 (ix, iy) 或 None。用于不依赖 CLAIM 校准值、动态点[立即领取]。
+       - 近黑判定: r,g,b < 70 (黑底按钮)
+       - 网格聚类: 60px 桶找最密簇, 取簇内平均坐标
+       - 过少黑像素(<40)视为没找到"""
+    w, h, ch, buf = load_png(path)
+    pts = []
+    for y in range(0, h, step):
+        for x in range(0, w, step):
+            i = (y * w + x) * ch
+            r, g, b = buf[i], buf[i+1], buf[i+2]
+            if r < 70 and g < 70 and b < 70:
+                pts.append((x, y))
+    if len(pts) < 40:
+        return None
+    # 60px 网格分桶, 找黑像素最密集的桶
+    bucket = {}
+    for x, y in pts:
+        key = (x // 60, y // 60)
+        bucket.setdefault(key, []).append((x, y))
+    best_key = max(bucket, key=lambda k: len(bucket[k]))
+    bpts = bucket[best_key]
+    return int(sum(p[0] for p in bpts) / len(bpts)), int(sum(p[1] for p in bpts) / len(bpts))
+
+def img_to_screen(ix, iy, img_w, img_h):
+    """图像坐标(客户区截图物理像素) -> 屏幕坐标。与 verify_claimed 的换算互逆:
+       verify_claimed: ix = (sx - o.x) * w / cw  =>  sx = o.x + ix * cw / w"""
+    cw = cliW if cliW else img_w
+    chh = cliH if cliH else img_h
+    return int(o.x + ix * cw / img_w), int(o.y + iy * chh / img_h)
+
+# ===================== 窗口钉死（彻底消除"自动移位导致坐标漂移"） =====================
+def _is_maximized(hwnd):
+    """检查窗口是否处于最大化状态（IsIconic 只检测最小化，不检测最大化）。"""
+    wp = ctypes.Structure
+    class WINDOWPLACEMENT(ctypes.Structure):
+        _fields_ = [("length", UINT), ("flags", UINT),
+                    ("showCmd", UINT),
+                    ("ptMinPosition", POINT), ("ptMaxPosition", POINT),
+                    ("rcNormalPosition", RECT)]
+    user32.GetWindowPlacement.argtypes = [HWND, ctypes.POINTER(WINDOWPLACEMENT)]
+    user32.GetWindowPlacement.restype = BOOL
+    pl = WINDOWPLACEMENT()
+    pl.length = ctypes.sizeof(WINDOWPLACEMENT)
+    if user32.GetWindowPlacement(hwnd, ctypes.byref(pl)):
+        return pl.showCmd == 3  # SW_MAXIMIZE = 3
+    return False
+
+def force_pos(hwnd, x=200, y=150, w=1500, h=1000):
+    """把目标窗口钉死到固定屏幕位置与尺寸, 使相对坐标完全确定、可复现。
+
+    关键坑: WorkBuddy 在 SetForegroundWindow 时会自动挪动/改自己窗口,
+    导致'打印坐标'与'实际点击坐标'漂移、点击打空(实测曾出现打印(690,1203)
+    却点到(1254,1358))。把窗口钉到固定位置后, 所有相对坐标稳定映射, 不再漂移。
+    校准值 AVATAR(38,30)/GAS(144,556)/CLAIM(89,112) 均在此布局下实测。
+
+    重要: 若窗口处于最大化状态, 必须先 ShowWindow(SW_RESTORE) 恢复正常尺寸,
+    否则 SetWindowPos 无法改变最大化窗口的位置和大小(会被系统拒绝)。"""
+    if _is_maximized(hwnd):
+        user32.ShowWindow(hwnd, SW_RESTORE)
+        time.sleep(0.4)
+    user32.SetWindowPos(hwnd, HWND_TOP, x, y, w, h, 0)
+    time.sleep(0.4)
+
 # ===================== 窗口置前（可靠三步） =====================
 def focus():
     """可靠把目标窗口置前(最小化先恢复, 线程绑定绕过前台锁, z序置顶)。
        原实现漏了 argtypes 声明导致 HWND 截断、SetForegroundWindow 静默失败,
        是"窗口没在最上方"导致点击打空的真凶。"""
     hwnd = _target
-    if user32.IsIconic(hwnd):
-        user32.ShowWindow(hwnd, SW_RESTORE)
-        time.sleep(0.3)
+    # 先确保窗口脱离最小化/幽灵状态(-32000 是 Windows 最小化窗口的哨兵坐标):
+    # restore 后验证 GetWindowRect, 若仍幽灵则重试(最多3次), 防 WorkBuddy 恢复慢/失败。
+    for _ in range(3):
+        if user32.IsIconic(hwnd):
+            user32.ShowWindow(hwnd, SW_RESTORE)
+            time.sleep(0.3)
+        rc = RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(rc))
+        if rc.left > -10000 and rc.right > rc.left and rc.bottom > rc.top:
+            break
+        user32.ShowWindow(hwnd, 5)   # SW_SHOW 兜底
+        time.sleep(0.4)
     fg = user32.GetForegroundWindow()
     if fg and fg != hwnd:
         fg_tid = user32.GetWindowThreadProcessId(fg, None)
@@ -394,8 +511,12 @@ def focus():
             user32.AttachThreadInput(fg_tid, my_tid, False)
     else:
         user32.SetForegroundWindow(hwnd)
-    user32.SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE)
+    # 注意: 不再调用 force_pos。WorkBuddy 会主动把 SetWindowPos 设的 (200,150) 1500x1000
+    # 改回原尺寸 1481x1005 并移到 (831,411) 之类——实测导致点击全部打空、面板根本没开、
+    # verify_claimed 又在主界面灰背景上误判 claimed(假阳性)。改为让 WorkBuddy 自己
+    # 把窗口恢复到自然位置(631,261)1481x1005, calibrate 相对坐标自适应不变。
     time.sleep(0.5)
+    recompute_geometry()   # 关键: 窗口可能刚从最小化恢复, rect 已从 -32000 变正常, 重算坐标
 
 # ===================== 运行前自检 =====================
 def _preflight():
@@ -414,12 +535,39 @@ def _preflight():
 def do_checkin():
     """执行签到。返回 (status, screenshot_path)
        status: 'success' | 'failed'
-       流程: 头像->加油站->直接点领取位置, 只验证最终是否处于灰底[今日已领]。"""
-    RESULT = os.path.join(os.path.dirname(os.path.abspath(__file__)), RESULT_NAME)
+       流程(固定左下角坐标, 不复杂化): focus(置前) -> 头像 -> 加油站 -> 中段校验
+       (面板打开?) -> 立即领取(固定 CLAIM 坐标) -> 终态校验(灰底今日已领?)。
 
-    focus()
+       中段校验关键防线: 若只点头像没点中加油站, 最终截图仍是 WorkBuddy 主界面,
+       verify_claimed 在按钮位置采样到主界面灰色背景会判 claimed -> 假阳性签到成功。
+       中段校验要求按钮位置必须有黑像素(黑色[立即领取]按钮), 否则直接判失败。"""
+    RESULT = os.path.join(os.path.dirname(os.path.abspath(__file__)), RESULT_NAME)
+    MID = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkin_mid.png")
+
+    focus()   # 解决"窗口不在前台": 最小化先恢复 + SetForegroundWindow 可靠置前
+    time.sleep(0.3); recompute_geometry()
     click_at(*sa, "头像/账户菜单"); time.sleep(0.8)
+    recompute_geometry()   # 坐标跟随窗口实际位置(GetWindowRect 原点), 每次点击前刷新
     click_at(*sg, "Buddy 加油站"); time.sleep(1.6)
+
+    # ===== 中段校验: 加油站面板是否真的打开了? =====
+    if not take_screenshot(_target, MID):
+        print("== 中段截图失败, 无法校验 ==")
+        return "failed", RESULT
+    mid_state = verify_claimed(MID, sc[0], sc[1])
+    if mid_state != "unclaimed":
+        print(f"== 中段校验: 加油站面板未打开 (verify_claimed={mid_state}, 按钮位置无黑像素) ==")
+        print("   → 极可能是 Buddy 加油站菜单项没点中, 面板根本没弹出来。")
+        print(f"     请重新校准 GAS_LEFT/GAS_BOTTOM (当前 {GAS_LEFT}/{GAS_BOTTOM}); 也可先 -calibrate 重新记录。")
+        print(f"     参考坐标: 头像{sa}  加油站{sg}  领取{sc}")
+        try:
+            import shutil as _sh; _sh.copy(MID, RESULT)
+        except Exception:
+            pass
+        return "failed", RESULT
+    print("== 中段校验: 加油站面板已打开 (检测到黑底立即领取按钮), 继续点立即领取 ==")
+
+    recompute_geometry()
     click_at(*sc, "立即领取"); time.sleep(2.0)
     if not take_screenshot(_target, RESULT):
         print("== 截图失败, 无法校验 ==")
