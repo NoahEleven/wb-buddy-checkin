@@ -13,6 +13,7 @@
 - 🎯 **坐标自适应**：用「相对客户区左下角」定位，窗口任意缩放都命中，校准一次长期复用。
 - 🪟 **三种校准**（见下）：弹窗悬浮窗（推荐）、终端交互、改代码常量。
 - 🌗 **主题无关校验**：用「近黑像素数」区分黑底「立即领取」与灰底「今日已领」，亮/暗色都正确。
+- 🛡️ **窗口精确匹配 + 坐标跟随窗口**：枚举只认标题完全等于 `WorkBuddy` 的主窗口（排除 `WorkBuddy - xxx` 子窗口）；坐标原点用 `GetWindowRect`（不用会被 WorkBuddy 干扰的 `ClientToScreen`），窗口被移去哪坐标就跟随到哪，天然免疫"窗口不在前台/被移动"。
 - 🔒 **零隐私绑定**：脚本不含任何个人身份、绝对路径或通知目标，可直接分享给任何人。
 
 ---
@@ -105,20 +106,25 @@ cwd 设为该 skill 的 `scripts/` 所在目录。
 
 ## 🛠️ 关键实现要点（避免重踩坑）
 
-1. **Win32 调用必须显式声明 `argtypes`**，`HWND` 按 `c_void_p`（64 位指针）传。不声明会被 ctypes 默认按 32 位 `c_int` 截断，导致 `SetForegroundWindow` 静默失败——表现为「窗口没置顶、点击打空」。本脚本已统一声明。
-2. **可靠置前三步**：最小化先 `ShowWindow(SW_RESTORE)` → `AttachThreadInput` 线程绑定绕过系统前台锁 → `SetWindowPos(HWND_TOP)` 置顶 z 序。
-3. **坐标用「相对客户区左下角」**（x=距左, y=距底），窗口任意缩放都命中。
-4. **校验用「近黑像素数」而非白字数**：灰底「今日已领」按钮也含白字，不能靠白字判定；黑底「立即领取」有大量近黑像素（r,g,b<70），灰按钮近黑像素≈0。
-5. **截图优先 desktop-control-win 的 `screen-info.ps1`**（若存在），否则回退 `PrintWindow` 客户区截图；PNG 编解码全用标准库手写（支持所有 filter），无外部依赖。
+1. **Win32 调用必须显式声明 `argtypes`**，`HWND` 按 `c_void_p`（64 位指针）传，回调签名用 `WINFUNCTYPE(BOOL, HWND, c_void_p)`。不声明会被 ctypes 默认按 32 位 `c_int` 截断，导致 `SetForegroundWindow` 静默失败——表现为「窗口没置顶、点击打空」。
+2. **窗口枚举精确匹配标题**：`if title == TARGET_TITLE`（=`WorkBuddy`）优先，排除「WorkBuddy - 个人中心 - xxx」等子窗口；找不到再兜底子串匹配。子串匹配会命中 z 序最前的子窗口（可能最小化/未显示）→ 点击全打空。
+3. **坐标原点用 `GetWindowRect` 的 left/top，不用 `ClientToScreen`**：实测点击头像弹出菜单后 `ClientToScreen` 返回 2× 错误值（`GetWindowRect` 正常 (619,169) 时它返回 (1238,338)），全部坐标翻倍打空——这是 2026-08-04 修复的**真正根因**。WorkBuddy 是无边框窗口（客户区=整个窗口），原点=窗口左上角，`GetWindowRect` 永远稳定，窗口被移去哪坐标就跟随到哪。
+4. **DPI 感知**：脚本开头 `SetProcessDpiAwareness(2)` + `SetProcessDPIAware()` 兜底，避免 DPI 虚拟化导致 GetWindowRect/SetCursorPos 坐标系不一致。
+5. **可靠置前**：最小化先 `ShowWindow(SW_RESTORE)`（验证 rect 脱离 -32000 幽灵坐标，重试 3 次）→ `AttachThreadInput` 线程绑定绕过前台锁 → `SetForegroundWindow`。**不要用 `SetWindowPos` 钉死窗口**——WorkBuddy 会主动移回原位置，反而坐标全乱。
+6. **坐标用「相对客户区左下角」**（x=距左, y=距底），窗口任意缩放都命中。
+7. **校验用「近黑像素数」而非白字数**：灰底「今日已领」按钮也含白字，不能靠白字判定；黑底「立即领取」有大量近黑像素（r,g,b<70），灰按钮近黑像素≈0。
+8. **中段校验防假阳性**：点完加油站先截图，按钮位置必须检测到黑像素（面板真的打开）才继续点领取。否则主界面灰背景会被误判成「已领」（假阳性签到成功）。
+9. **截图优先 desktop-control-win 的 `screen-info.ps1`**（若存在），否则回退 `PrintWindow` 客户区截图；PNG 编解码全用标准库手写（支持所有 filter），无外部依赖。
 
 ---
 
 ## ❓ 常见问题
 
 - **只会点头像 / 后续点击打空**：没校准，用的是默认示例坐标。先 `-calibrate-gui` 记录三个点。
-- **点击打空 / 窗口没被置前**：Win32 调用未声明 `argtypes` 导致 HWND 被截断的典型症状，本脚本已修复。仍无效则确认 WorkBuddy 未被最小化到托盘且未被其他全屏窗口遮挡。
+- **点击打空 / 窗口没被置前**：① 确认脚本枚举到的是主窗口（精确标题 `WorkBuddy`，排除 `WorkBuddy - xxx` 子窗口——旧版子串匹配会误选子窗口导致全打空）；② 坐标原点用 `GetWindowRect` 而非 `ClientToScreen`（后者被 WorkBuddy 干扰会返回 2× 错误值）。本脚本已全部修复。
 - **暗色主题误判**：校验用「近黑像素数」而非白字数，主题无关，亮/暗色都正确。
 - **截图失败**：优先用 desktop-control-win，否则回退 `PrintWindow`；两者都失败则签到仍会执行但无法自动校验（退出码 2）。
+- **PowerShell 调用 desktop-control 报"环境块不能多于 65535 字节"**：先 `Remove-Item Env:ACC_PRODUCT_CONFIG_V3 -ErrorAction SilentlyContinue` 再调用。
 
 ---
 
