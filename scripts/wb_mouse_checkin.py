@@ -141,6 +141,8 @@ class POINT(ctypes.Structure):
 
 user32.GetCursorPos.argtypes = [ctypes.POINTER(POINT)]
 user32.GetCursorPos.restype = BOOL
+user32.GetSystemMetrics.argtypes = [INT]
+user32.GetSystemMetrics.restype = INT
 class BITMAPINFOHEADER(ctypes.Structure):
     _fields_ = [("biSize", UINT), ("biWidth", INT), ("biHeight", INT),
                 ("biPlanes", SHORT), ("biBitCount", SHORT), ("biCompression", UINT),
@@ -221,9 +223,24 @@ def recompute_geometry():
        (wr=(619,169,1500x1000) 正常, 但 o=(1238,338)), 导致全部坐标翻倍打空。
        WorkBuddy 是无边框窗口(Chrome_WidgetWin_1), 客户区 = 整个窗口,
        客户区原点 = 窗口左上角 = GetWindowRect 的 left/top, 稳定可靠。
-       窗口被移去哪坐标就跟随到哪, 天然免疫"窗口不在前台/被移动"。"""
+       窗口被移去哪坐标就跟随到哪, 天然免疫"窗口不在前台/被移动"。
+
+       2026-08-06 防御: 幽灵矩形(-32000) = 窗口处于最小化/恢复动画中。
+       实测: 点完 Buddy 加油站后窗口短暂进入最小化态, GetWindowRect 返回
+       (-32000,-32000,160x28), 直接用它算坐标会把立即领取点打到屏幕外
+       (-31911,-32084)。这里检测到幽灵矩形就自动恢复窗口并重读一次,
+       仍异常则保留上次有效几何(不更新全局), 保证后续点击坐标不飞。"""
     global wr, cr, o, winW, winH, cliW, cliH, scaleX, scaleY, sa, sg, sc
     user32.GetWindowRect(_target, ctypes.byref(wr))
+    if wr.left < -10000 or wr.right <= wr.left or wr.bottom <= wr.top:
+        # 幽灵矩形: 尝试恢复窗口(最小化->正常), 再重读一次
+        if user32.IsIconic(_target):
+            user32.ShowWindow(_target, SW_RESTORE)
+            time.sleep(0.4)
+        user32.GetWindowRect(_target, ctypes.byref(wr))
+        if wr.left < -10000 or wr.right <= wr.left or wr.bottom <= wr.top:
+            # 窗口仍异常(可能是恢复动画中), 保留上次有效坐标, 本次不更新
+            return
     user32.GetClientRect(_target, ctypes.byref(cr))
     o.x = wr.left
     o.y = wr.top
@@ -253,14 +270,64 @@ def _print_coords():
     print()
 
 # ===================== 鼠标点击（纯 ctypes，可靠） =====================
+# 2026-08-12: 点击前 SetCursorPos 后停顿 0.12s -> 0.4s。
+# 原因: 老板反馈"脚本控制鼠标时我正在用电脑, 移动不到正确位置"——
+# 强制移动(SetCursorPos)本身没问题, 问题是与老板实时操作打架。
+# 解决方案: ① do_checkin 开头 wait_mouse_idle() 等老板停手再接管(不抢);
+#           ② SetCursorPos 的移动本身就是"小虾接管"的视觉预告, 多停 0.4s
+#              给老板看到鼠标飞过去、松手确认。
 def click_at(sx, sy, name):
     print(f">> 点击 {name} @ 屏幕 ({sx}, {sy})")
     user32.SetCursorPos(sx, sy)
-    time.sleep(0.12)
+    time.sleep(0.4)
     user32.mouse_event(0x0002, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTDOWN
     time.sleep(0.05)
     user32.mouse_event(0x0004, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTUP
     time.sleep(0.3)
+
+# ===================== 鼠标空闲检测（2026-08-12 防"撞老板操作"） =====================
+# 老板在用电脑(鼠标在动)时, 脚本安静等待, 绝不抢鼠标、不打断老板;
+# 等鼠标连续静止 IDLE_SETTLE 秒才接管。老板不在电脑前时鼠标静止,
+# 首次采样后约 IDLE_SETTLE 秒即通过, 与以前一样快。
+# GetCursorPos 是纯读取, 不影响鼠标, 不打扰老板。
+IDLE_SETTLE  = 2.0    # 鼠标连续静止多少秒才算"空闲"
+IDLE_TIMEOUT = 60.0   # 最多等多久(秒); 超时继续执行, 不阻塞定时任务
+
+def wait_mouse_idle():
+    """等待鼠标空闲后返回。返回 True=检测到空闲; False=超时(仍继续执行)。"""
+    p1 = POINT(); user32.GetCursorPos(ctypes.byref(p1))
+    start = time.time(); idle_since = time.time()
+    print(f"[接管] 等待鼠标空闲(连续静止{IDLE_SETTLE:.0f}s才接管, 最多等{IDLE_TIMEOUT:.0f}s)...")
+    while time.time() - start < IDLE_TIMEOUT:
+        time.sleep(0.3)
+        p2 = POINT(); user32.GetCursorPos(ctypes.byref(p2))
+        if p2.x == p1.x and p2.y == p1.y:
+            if time.time() - idle_since >= IDLE_SETTLE:
+                print(f"[接管] 鼠标已静止 {IDLE_SETTLE:.0f}s → 开始接管(鼠标将自动移动, 注意!)")
+                return True
+        else:
+            idle_since = time.time()
+        p1 = p2
+    print(f"[接管] 等待超时({IDLE_TIMEOUT:.0f}s), 继续执行(不阻塞)")
+    return False
+
+# ===================== 接管预告（2026-08-12 老板建议） =====================
+# 老板反馈: "在点头像之前多一段移动鼠标的冗余, 让我知道你在操作;
+#            或者你可以先执行两次移动到头像位置"。
+# 实现: announce_move() 在真正点击前把鼠标做两次可见的往返移动
+#       (目标点 -> 屏幕右上角空白处 -> 目标点), 让老板看到鼠标"自己动",
+#       明确知道小虾要接管了, 提前松手/移开视线, 避免与老板实时操作打架。
+def announce_move(target, name):
+    """接管预告: 鼠标先飞向 target, 再移开(屏幕右上角), 再飞回 target。
+       形成两次明显的可见位移, 提示老板"小虾要开始操作了"。
+       target: 屏幕坐标 (sx, sy)。移动过程中不点击, 纯预告。"""
+    sw = user32.GetSystemMetrics(0)   # 屏幕宽
+    sh = user32.GetSystemMetrics(1)   # 屏幕高
+    corner = (sw - 40, 40)            # 屏幕右上角空白区(避开任务栏/开始菜单)
+    print(f"[预告] 接管提示: 鼠标 {name}@({target[0]},{target[1]}) → 右上角{corner} → 回到{name}")
+    user32.SetCursorPos(target[0], target[1]); time.sleep(0.5)
+    user32.SetCursorPos(corner[0], corner[1]); time.sleep(0.5)
+    user32.SetCursorPos(target[0], target[1]); time.sleep(0.5)
 
 # ===================== PNG 解码（stdlib，用于校验，支持所有 filter） =====================
 def load_png(path):
@@ -544,8 +611,10 @@ def do_checkin():
     RESULT = os.path.join(os.path.dirname(os.path.abspath(__file__)), RESULT_NAME)
     MID = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkin_mid.png")
 
+    wait_mouse_idle()  # 2026-08-12: 老板在用电脑时安静等待, 不抢鼠标; 空闲后才接管
     focus()   # 解决"窗口不在前台": 最小化先恢复 + SetForegroundWindow 可靠置前
     time.sleep(0.3); recompute_geometry()
+    announce_move(sa, "头像/账户菜单")  # 2026-08-12: 点击前两次可见位移, 提示老板"小虾要操作了"
     click_at(*sa, "头像/账户菜单"); time.sleep(0.8)
     recompute_geometry()   # 坐标跟随窗口实际位置(GetWindowRect 原点), 每次点击前刷新
     click_at(*sg, "Buddy 加油站"); time.sleep(1.6)
