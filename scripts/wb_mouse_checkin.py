@@ -63,6 +63,16 @@ CLAIM_BOTTOM  = 113   #                     距底
 RESULT_NAME = "checkin_result.png"
 # =============================================================================================
 
+# ===================== 更新续签 · Windows 计划任务（2026-08-17） =====================
+# 关键背景(老板质疑): WorkBuddy 重启时, 定时任务会话(运行在 WorkBuddy 应用进程内)
+# 会连同"等几分钟重跑"的逻辑一起被终止 —— 依赖会话续签不可靠!
+# 可靠载体 = Windows 任务计划程序(schtasks): 独立于 WorkBuddy 进程,
+# 脚本点[重启升级]前注册一个 RESUME_DELAY 秒后运行的 -resume 计划任务,
+# WorkBuddy 重启不影响它; 到点独立 python 进程唤醒, 检查续签标记 -> 等窗口 -> 补签。
+RESUME_TASK_NAME = "WB_Checkin_Resume"   # Windows 计划任务名
+RESUME_DELAY_SEC = 480                   # 点更新后多久由计划任务接管续签(8 分钟, 覆盖下载+安装+重启)
+RESUME_WAIT_WIN  = 600                   # -resume 等 WorkBuddy 窗口出现的上限(秒)
+
 
 # ===================== 显式声明 Win32 调用签名（关键！） =====================
 # HWND 是 64 位指针, 不声明 argtypes 会被 ctypes 默认按 32 位 c_int 截断,
@@ -82,6 +92,8 @@ user32.GetWindowTextLengthW.argtypes = [HWND]
 user32.GetWindowTextLengthW.restype = INT
 user32.IsWindowVisible.argtypes = [HWND]
 user32.IsWindowVisible.restype = BOOL
+user32.IsWindow.argtypes = [HWND]                # 2026-08-17: 检测旧窗口句柄是否失效(点更新后应用重启)
+user32.IsWindow.restype = BOOL
 user32.FindWindowW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]
 user32.FindWindowW.restype = HWND
 user32.GetWindowRect.argtypes = [HWND, ctypes.c_void_p]
@@ -454,6 +466,128 @@ def take_screenshot(hwnd, out_path):
             pass
     return _screenshot_pw(hwnd, out_path)
 
+# ===================== 更新提示检测与处理（2026-08-17） =====================
+# 老板反馈: "有时候签到不成功, WorkBuddy 有更新提示遮住了头像"。
+# 实测横幅形态(见 checkin_after_ctrlw.png, 老板确认):
+#   - 横跨客户区**底部**的白色条带(约 8% 客户区高度)
+#   - 内容: 左侧升级图标 + 文案"新版本就绪"
+#           + **绿色按钮「重启升级」** (teal 色, 实测 avgRGB=(95,208,169))
+#           + 白色按钮「更新日志」(与白色横幅同色, 靠边框区分, 不点它)
+#           + 右侧 × 关闭
+#   - 头像在左下角被横幅遮住, 点头像无效 -> 签到失败
+# 方案: 点头像之前先截图, 在客户区**底部 85%~100%** 区域扫描 teal 色像素
+#       (G 分量显著高于 R, 整体中等亮度 = 品牌青绿按钮),
+#       检测到即点击完成"点击更新(重启升级)", 然后等待横幅消失/应用重启。
+# 颜色特征(teal): g >= 150, g - r >= 40, b >= 90, r <= 180。
+#   实测 avgRGB=(95,208,169): g-r=113, 命中; 普通灰色 UI(g-r≈0) 天然不命中。
+# 风险与缓解:
+#   - 误判: 底部若有其它 teal 元素。缓解: g-r>=40 苛刻阈值 + 最大簇限制 +
+#     簇尺寸阈值(>= 80 采样点, step=2)。
+#   - 点「重启升级」后应用重启: 旧窗口句柄失效, 轮询等新窗口出现并重新绑定。
+def detect_update_overlay(path):
+    """检测 WorkBuddy 底部更新横幅, 返回「重启升级」绿色按钮屏幕坐标 (sx, sy, size) 或 None。
+       横幅特征: 客户区底部 85%~100% 区域有 teal 色大按钮簇(品牌青绿)。"""
+    try:
+        w, h, ch, buf = load_png(path)
+    except Exception:
+        return None
+    if w < 200 or h < 200:
+        return None
+    # 底部 85%~100% 区域 (横幅条带)
+    y0 = int(h * 0.85)
+    # 扫描 teal 色像素: G 高, R 低, B 中 (品牌青绿按钮)
+    cands = []
+    for y in range(y0, h, 2):
+        for x in range(0, w, 2):
+            i = (y * w + x) * ch
+            r, g, b = buf[i], buf[i+1], buf[i+2]
+            if g >= 150 and g - r >= 40 and b >= 90 and r <= 180:
+                cands.append((x, y))
+    if len(cands) < 100:
+        return None
+    # 60px 桶找最大簇
+    bucket = {}
+    for x, y in cands:
+        key = (x // 60, y // 60)
+        bucket.setdefault(key, []).append((x, y))
+    best_key = max(bucket, key=lambda k: len(bucket[k]))
+    pts = bucket[best_key]
+    if len(pts) < 80:    # 太小视为误判
+        return None
+    ix = int(sum(p[0] for p in pts) / len(pts))
+    iy = int(sum(p[1] for p in pts) / len(pts))
+    sx, sy = img_to_screen(ix, iy, w, h)
+    return (sx, sy, len(pts))
+
+def _enum_workbuddy_hwnd():
+    """重新枚举找 WorkBuddy 主窗口(精确匹配优先), 返回 hwnd 或 None。
+       不修改全局 _target, 供 wait_for_new_window 等场景安全调用。"""
+    found_exact = [None]
+    found_substr = [None]
+    def cb(hwnd, lp):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        length = user32.GetWindowTextLengthW(hwnd)
+        if length == 0:
+            return True
+        buf = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, buf, length + 1)
+        title = buf.value.strip()
+        if title == TARGET_TITLE:
+            found_exact[0] = hwnd
+            return False
+        if TARGET_TITLE in title and found_substr[0] is None:
+            found_substr[0] = hwnd
+        return True
+    EnumWindowsProc = ctypes.WINFUNCTYPE(BOOL, HWND, ctypes.c_void_p)
+    user32.EnumWindows(EnumWindowsProc(cb), 0)
+    return found_exact[0] or found_substr[0] or user32.FindWindowW(None, TARGET_TITLE)
+
+def wait_for_new_window(old_hwnd, timeout=120):
+    """轮询等待新的 WorkBuddy 窗口出现(应用重启后句柄变化), 返回新 hwnd 或 None。
+       不会复用 old_hwnd; 只有新出现的 hwnd 才返回。"""
+    start = time.time()
+    while time.time() - start < timeout:
+        nt = _enum_workbuddy_hwnd()
+        if nt and nt != old_hwnd and user32.IsWindow(nt):
+            return nt
+        time.sleep(2)
+    return None
+
+def handle_update_overlay(pre_path, timeout=180):
+    """检测并处理更新弹窗(完成"点击更新")。
+       流程: 截图 -> detect_update_overlay -> 若有按钮, announce+click ->
+             轮询: 窗口重启? 弹窗消失?  -> 返回结果。
+       返回: 'done'(弹窗消失) | 'restarted'(应用重启完成, 新窗口已绑) | 
+             'timeout'(超时) | 'not_found'(未检测到更新弹窗) | 'still'(点击后弹窗仍在, 但超时)"""
+    btn = detect_update_overlay(pre_path)
+    if not btn:
+        return 'not_found'
+    sx, sy, size = btn
+    print(f"== 检测到可能的更新弹窗(中央彩色按钮 @{sx},{sy}, 簇大小 {size}), 点击[更新] ==")
+    print("   (若实际不是更新弹窗而是主界面元素, 误点通常无害, 但会消耗一次) ")
+    # 复用防撞约定: 预告 + 0.4s 停顿
+    announce_move((sx, sy), "更新按钮")
+    click_at(sx, sy, "更新按钮")
+    # 轮询: 弹窗是否消失 或 窗口是否重启
+    overlay_chk = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkin_overlay_chk.png")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(3)
+        # 检查旧窗口是否还在
+        if not user32.IsWindow(_target):
+            # 旧窗口销毁 -> 应用重启中, 等新窗口
+            print("   (旧窗口句柄失效, 等待新窗口出现...)")
+            new = wait_for_new_window(_target, timeout=60)
+            if new:
+                return 'restarted'   # 注意: _target 暂未更新, 由调用方在重启流程后统一 rebind
+            continue
+        # 旧窗口还在, 截图检查弹窗是否消失
+        if take_screenshot(_target, overlay_chk):
+            if not detect_update_overlay(overlay_chk):
+                return 'done'
+    return 'timeout'
+
 # ===================== 领取结果验证（定点采样，主题无关） =====================
 # 领取位置只有两种终态:
 #   - 未领取: 仍是黑底白字[立即领取]按钮 -> 按钮内大量**近黑像素**(r,g,b<70)
@@ -599,21 +733,155 @@ def _preflight():
     return warns
 
 # ===================== 主流程 =====================
-def do_checkin():
-    """执行签到。返回 (status, screenshot_path)
-       status: 'success' | 'failed'
-       流程(固定左下角坐标, 不复杂化): focus(置前) -> 头像 -> 加油站 -> 中段校验
-       (面板打开?) -> 立即领取(固定 CLAIM 坐标) -> 终态校验(灰底今日已领?)。
+# 2026-08-17 重构(老板需求): 签到失败 -> 检查是否有更新横幅 -> 有则点[重启升级] ->
+#   应用重启后**继续执行签到**(最多 3 轮); 实在等不到重启则写续签标记 + 退出码 4,
+#   由外部(定时任务会话)在更新完成后接管续签。
+MAX_CHECKIN_ATTEMPTS = 3
+STATE_JSON = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkin_state.json")
 
-       中段校验关键防线: 若只点头像没点中加油站, 最终截图仍是 WorkBuddy 主界面,
-       verify_claimed 在按钮位置采样到主界面灰色背景会判 claimed -> 假阳性签到成功。
-       中段校验要求按钮位置必须有黑像素(黑色[立即领取]按钮), 否则直接判失败。"""
+def mark_pending(reason):
+    """写续签标记(应用更新重启中, 需在重启完成后继续签到)。"""
+    try:
+        with open(STATE_JSON, "w", encoding="utf-8") as f:
+            json.dump({"pending": True, "reason": reason,
+                       "ts": time.strftime("%Y-%m-%d %H:%M:%S")},
+                      f, ensure_ascii=False, indent=2)
+        print(f"== 已写续签标记: {STATE_JSON} (reason={reason})")
+    except Exception as e:
+        print(f"== 写续签标记失败: {e}")
+
+def clear_pending_state():
+    """签到成功后清除续签标记。"""
+    try:
+        if os.path.exists(STATE_JSON):
+            os.remove(STATE_JSON)
+            print("== 已清除续签标记(签到成功)")
+    except Exception:
+        pass
+
+# ===================== 续签载体: Windows 计划任务（2026-08-17 关键修复） =====================
+# WorkBuddy 重启会杀掉运行在它进程内的 agent 会话(包括"等几分钟重跑"的定时逻辑),
+# 所以续签不能依赖会话, 必须用独立于 WorkBuddy 的 Windows 计划任务:
+#   点[重启升级]前 schedule_resume_task() 注册 8 分钟后的 -resume 计划任务
+#   -> WorkBuddy 重启不影响计划任务 -> 到点独立 python 进程唤醒
+#   -> do_resume() 检查 checkin_state.json(pending?) -> 等 WorkBuddy 窗口出现
+#   -> attempt_checkin() 补签 -> 成功: 清标记 + cancel_resume_task()
+def schedule_resume_task():
+    """注册 Windows 计划任务: RESUME_DELAY_SEC 秒后运行本脚本 -resume 模式。
+       返回 True/False。计划任务独立于 WorkBuddy 进程, 是续签的可靠载体。"""
+    try:
+        py = sys.executable
+        script = os.path.abspath(__file__)
+        st = time.strftime("%H:%M", time.localtime(time.time() + RESUME_DELAY_SEC))
+        r = subprocess.run(
+            ["schtasks", "/create", "/tn", RESUME_TASK_NAME,
+             "/tr", f'"{py}" "{script}" -resume',
+             "/sc", "once", "/st", st, "/f"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+        if r.returncode == 0:
+            print(f"== 已注册续签计划任务 [{RESUME_TASK_NAME}] {st} 执行: -resume (独立于 WorkBuddy 进程)")
+            return True
+        print(f"== 注册续签计划任务失败: {r.stderr.strip() or r.stdout.strip()}")
+        return False
+    except Exception as e:
+        print(f"== 注册续签计划任务异常: {e}")
+        return False
+
+def cancel_resume_task():
+    """删除续签计划任务(续签完成/不需要时清理, 防止残留)。"""
+    try:
+        subprocess.run(["schtasks", "/delete", "/tn", RESUME_TASK_NAME, "/f"],
+                       capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+        print(f"== 已删除续签计划任务 [{RESUME_TASK_NAME}]")
+    except Exception:
+        pass
+
+def do_resume():
+    """-resume 模式: 更新重启后的续签入口(由 Windows 计划任务独立唤醒)。
+       流程: 读 checkin_state.json -> 非 pending 直接结束(无需续签) ->
+             等 WorkBuddy 窗口出现(最长 RESUME_WAIT_WIN 秒) -> attempt_checkin 补签 ->
+             成功: 清标记 + 删计划任务, 退出 0; 失败: 保留标记, 退出 2。"""
+    global _target
+    print("== [resume] 续签模式启动(Windows 计划任务独立唤醒) ==")
+    # 1) 检查是否真的需要续签
+    need = False
+    try:
+        if os.path.exists(STATE_JSON):
+            with open(STATE_JSON, encoding="utf-8") as f:
+                need = bool(json.load(f).get("pending"))
+    except Exception:
+        pass
+    if not need:
+        print("== [resume] 无续签标记(pending=false 或文件不存在), 无需补签, 结束 ==")
+        cancel_resume_task()
+        return 0
+    print(f"== [resume] 检测到续签标记, 等待 WorkBuddy 窗口出现(最长 {RESUME_WAIT_WIN}s)... ==")
+    # 2) 等 WorkBuddy 更新重启完成(窗口重新出现)
+    deadline = time.time() + RESUME_WAIT_WIN
+    while time.time() < deadline:
+        hwnd = _enum_workbuddy_hwnd()
+        if hwnd and user32.IsWindow(hwnd):
+            _target = hwnd
+            print(f"== [resume] WorkBuddy 窗口已出现 hwnd={hwnd}, 开始补签 ==")
+            break
+        time.sleep(3)
+    else:
+        print(f"== [resume] {RESUME_WAIT_WIN}s 内未等到 WorkBuddy 窗口, 补签失败(保留标记) ==")
+        return 2
+    # 3) 补签(单轮即可; 若又遇到更新横幅, attempt_checkin 内部会再点更新,
+    #    此时不重复注册计划任务——由本进程继续等/续签, 避免任务堆积)
+    st = attempt_checkin()
+    if st == "success":
+        clear_pending_state()
+        cancel_resume_task()
+        print("== [resume] 续签成功, 已清除标记并删除计划任务 ==")
+        return 0
+    print("== [resume] 续签失败(见上方日志), 保留续签标记 ==")
+    return 2
+
+def attempt_checkin():
+    """单轮完整签到。返回 'success' | 'failed'。
+       流程: wait_mouse_idle -> focus -> 前置横幅检测(有则处理) ->
+       头像 -> Buddy加油站 -> 中段校验(面板打开?) -> 立即领取 -> 终态校验(灰底今日已领?)。"""
+    global _target
     RESULT = os.path.join(os.path.dirname(os.path.abspath(__file__)), RESULT_NAME)
     MID = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkin_mid.png")
+    PRE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkin_pre.png")
 
     wait_mouse_idle()  # 2026-08-12: 老板在用电脑时安静等待, 不抢鼠标; 空闲后才接管
     focus()   # 解决"窗口不在前台": 最小化先恢复 + SetForegroundWindow 可靠置前
     time.sleep(0.3); recompute_geometry()
+
+    # ===== 2026-08-17: 前置更新横幅检测与处理 =====
+    # 更新横幅(底部白色条带 + 绿色[重启升级]按钮)会遮住左下角头像, 点头像点到横幅上。
+    # 点头像前先截图, 检测到绿色按钮就点击完成更新, 等横幅消失/应用重启后再签到。
+    if take_screenshot(_target, PRE):
+        ovr = handle_update_overlay(PRE, timeout=120)
+        if ovr == 'restarted':
+            # 应用已重启, 新窗口出现, 重新绑定并重算坐标 (global 声明, 修复局部变量坑)
+            new_hwnd = wait_for_new_window(_target, timeout=60) or _enum_workbuddy_hwnd()
+            if new_hwnd and user32.IsWindow(new_hwnd):
+                _target = new_hwnd
+                print(f"== 已绑定新窗口(更新后重启) hwnd={new_hwnd} ==")
+                focus(); time.sleep(0.5); recompute_geometry()
+                if take_screenshot(_target, PRE) and detect_update_overlay(PRE):
+                    print("== 重启后仍有更新横幅(可能要二次确认), 本轮失败 ==")
+                    return "failed"
+            else:
+                print("== 应用重启后未找到新窗口, 本轮失败 ==")
+                return "failed"
+        elif ovr == 'done':
+            time.sleep(0.5); focus(); time.sleep(0.5); recompute_geometry()
+            if take_screenshot(_target, PRE) and detect_update_overlay(PRE):
+                print("== 点击后仍检测到更新横幅(可能需更长时间), 本轮失败 ==")
+                return "failed"
+        elif ovr == 'timeout':
+            print("== 前置更新处理超时(120s), 本轮失败 ==")
+            return "failed"
+        # 'not_found' 正常情况, 继续签到流程
+    else:
+        print("== 预截图失败, 跳过更新横幅检测, 直接进入签到流程 ==")
+
     announce_move(sa, "头像/账户菜单")  # 2026-08-12: 点击前两次可见位移, 提示老板"小虾要操作了"
     click_at(*sa, "头像/账户菜单"); time.sleep(0.8)
     recompute_geometry()   # 坐标跟随窗口实际位置(GetWindowRect 原点), 每次点击前刷新
@@ -622,7 +890,7 @@ def do_checkin():
     # ===== 中段校验: 加油站面板是否真的打开了? =====
     if not take_screenshot(_target, MID):
         print("== 中段截图失败, 无法校验 ==")
-        return "failed", RESULT
+        return "failed"
     mid_state = verify_claimed(MID, sc[0], sc[1])
     if mid_state != "unclaimed":
         print(f"== 中段校验: 加油站面板未打开 (verify_claimed={mid_state}, 按钮位置无黑像素) ==")
@@ -633,26 +901,78 @@ def do_checkin():
             import shutil as _sh; _sh.copy(MID, RESULT)
         except Exception:
             pass
-        return "failed", RESULT
+        return "failed"
     print("== 中段校验: 加油站面板已打开 (检测到黑底立即领取按钮), 继续点立即领取 ==")
 
     recompute_geometry()
     click_at(*sc, "立即领取"); time.sleep(2.0)
     if not take_screenshot(_target, RESULT):
         print("== 截图失败, 无法校验 ==")
-        return "failed", RESULT
+        return "failed"
     state = verify_claimed(RESULT, sc[0], sc[1])
     if state == "claimed":
         print("== 校验通过: 领取位置已是灰底[今日已领], 领取成功 ==")
-        return "success", RESULT
+        return "success"
     if state == "unclaimed":
         print("== 校验失败: 领取位置仍是黑底[立即领取], 没点中 ==")
         print(f"   → 面板已打开但[立即领取]按钮没点中, 请重新校准 CLAIM_LEFT/CLAIM_BOTTOM (当前 {CLAIM_LEFT}/{CLAIM_BOTTOM})")
-        return "failed", RESULT
+        return "failed"
     print("== 校验异常: 领取位置既无黑按钮也无灰按钮 ==")
     print("   → 多半是【Buddy 加油站】菜单项没点中, 面板根本没打开 (或打开了但不在预期位置)。")
     print(f"     请重点重新校准 GAS_LEFT/GAS_BOTTOM (当前 {GAS_LEFT}/{GAS_BOTTOM}); 也可先 -calibrate 重新记录。")
     print(f"     参考坐标: 头像{sa}  加油站{sg}  领取{sc}")
+    return "failed"
+
+def do_checkin():
+    """执行签到(含失败兜底)。返回 (status, screenshot_path)
+       status: 'success' | 'failed' | 'update_pending'
+       - 每轮先签到; 失败则截图检测更新横幅:
+         * 有横幅 -> 点[重启升级] -> 写续签标记 -> 等应用重启(最长 180s)
+           -> 重启成功: 下一轮继续签到(最多 MAX_CHECKIN_ATTEMPTS 轮)
+           -> 重启超时: 返回 'update_pending'(退出码 4), 由外部定时任务续签
+         * 无横幅 -> 判定真实失败
+       - 签到成功 -> 清除续签标记"""
+    global _target
+    RESULT = os.path.join(os.path.dirname(os.path.abspath(__file__)), RESULT_NAME)
+    PRE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkin_pre.png")
+
+    for attempt in range(1, MAX_CHECKIN_ATTEMPTS + 1):
+        print(f"\n===== 签到尝试 {attempt}/{MAX_CHECKIN_ATTEMPTS} =====")
+        st = attempt_checkin()
+        if st == "success":
+            clear_pending_state()
+            return "success", RESULT
+
+        # ===== 失败兜底: 检查是否有更新横幅作祟 =====
+        print(f"== 签到失败(第 {attempt} 轮), 检查是否有更新横幅... ==")
+        time.sleep(0.6)
+        if take_screenshot(_target, PRE):
+            btn = detect_update_overlay(PRE)
+            if btn:
+                sx, sy, size = btn
+                print(f"== 检测到更新横幅(绿色[重启升级]按钮 @{sx},{sy}, 簇 {size}), 点击完成更新 ==")
+                announce_move((sx, sy), "重启升级")
+                click_at(sx, sy, "重启升级")
+                mark_pending("update_restart")
+                # 2026-08-17 关键: WorkBuddy 重启会杀掉 agent 会话, 续签不能依赖会话。
+                # 先注册独立于 WorkBuddy 的 Windows 计划任务(8 分钟后 -resume),
+                # 即使本进程/会话随重启终止, 计划任务到点也会独立唤醒补签。
+                schedule_resume_task()
+                # 本进程若还活着, 顺便等应用重启(最长 180s)直接续签, 不等计划任务
+                print("== 等待应用重启完成(最长 180s; 若本进程被杀, 计划任务会接管) ... ==")
+                new = wait_for_new_window(_target, timeout=180)
+                if new and user32.IsWindow(new):
+                    _target = new
+                    cancel_resume_task()   # 本进程已接管续签, 撤掉计划任务避免重复
+                    print(f"== 应用重启完成, 已绑定新窗口 hwnd={new}, 下一轮继续签到 ==")
+                    focus(); time.sleep(0.6); recompute_geometry()
+                    continue   # 下一轮续签
+                print("== 180s 内未等到新窗口(可能本进程即将被重启终止), 已注册计划任务兜底, 返回 update_pending ==")
+                return "update_pending", RESULT
+        print("== 无更新横幅, 判定为真实失败 ==")
+        return "failed", RESULT
+
+    print(f"== 已达最大尝试次数({MAX_CHECKIN_ATTEMPTS} 轮), 签到失败 ==")
     return "failed", RESULT
 
 def do_sample():
@@ -805,6 +1125,12 @@ if __name__ == "__main__":
         _print_coords()
         sys.exit(do_calibrate())
 
+    if "-resume" in sys.argv:
+        # 2026-08-17: 更新重启后的续签入口, 由 Windows 计划任务独立唤醒
+        # (独立 python 进程, 不依赖 WorkBuddy / agent 会话存活)
+        code = do_resume()
+        sys.exit(code)
+
     if "-run" not in sys.argv:
         _print_coords()
         for w in _preflight():
@@ -817,5 +1143,6 @@ if __name__ == "__main__":
         print("⚠️ " + w)
     status, shot = do_checkin()
     print(f"\n== 结论: {status.upper()} | 截图: {shot} ==")
-    code = {"success": 0, "failed": 2}.get(status, 2)
+    # 退出码: 0=成功  2=失败(无更新横幅/更新后仍失败)  4=更新重启中(待续签, 需外部定时任务接管)
+    code = {"success": 0, "failed": 2, "update_pending": 4}.get(status, 2)
     sys.exit(code)
