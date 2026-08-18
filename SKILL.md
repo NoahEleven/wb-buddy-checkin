@@ -51,7 +51,30 @@ python scripts/wb_mouse_checkin.py -run
 
 ## 使用方法
 
-脚本位于 `scripts/wb_mouse_checkin.py`，三种模式：
+脚本位于 `scripts/`，**两套方案**：
+
+### 方案 A：API 直连（推荐，2026-08-18 新增）
+
+零 GUI 依赖，无窗口位置/DPI/更新横幅遮挡问题。读本地登录态直调官方接口：
+
+```bash
+# 查询状态 + 未签则领取（幂等）
+python scripts/wb_api_checkin.py
+
+# 仅查询，不领取
+python scripts/wb_api_checkin.py -status
+```
+
+退出码：`0`=成功/已签到 / `2`=失败（无登录态/接口异常）。
+
+**原理**（2026-08-18 逆向自 app.asar + 实测验证）：
+- 登录态文件：`%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info`（明文 JSON，`auth.accessToken` 为 JWT；同一账号体系，WorkBuddy/CodeBuddy 通用）
+- 后端 host：`https://copilot.tencent.com`（前端 origin，`getFullUrl = window.location.origin + path`）
+- 接口：`POST /billing/meter/checkin-status`（查询）、`POST /billing/meter/daily-checkin`（领取，幂等，已签返回 code 10001「今天已签到，请明天再来」）
+- 认证：`Authorization: Bearer <accessToken>`；**必须带浏览器 User-Agent**，否则服务端裸 400（2026-08-18 实测坑）
+- 接口调用方式与 SkillHub workbuddy-checkin / workbuddy-daily-checkin 同款（官方路径社区也已证实）
+
+### 方案 B：GUI 坐标点击（原方案，兜底）
 
 ```bash
 # 1) 干跑：打印窗口信息 + 计算好的点击坐标 + 校准状态告警，不点击
@@ -67,9 +90,35 @@ python scripts/wb_mouse_checkin.py -calibrate-gui
 python scripts/wb_mouse_checkin.py -calibrate
 ```
 
-退出码：`0`=成功（已处于「今日已领」） / `2`=失败（未领取或面板异常，报错会指明该校准哪个点） / `3`=未找到 WorkBuddy 窗口。
+**推荐组合**：每日任务先跑方案 A（API，稳、快），退出码 2 时回退方案 B（GUI 点击，覆盖登录态异常场景）。
+
+退出码：`0`=成功（已处于「今日已领」） / `2`=失败（未领取、面板异常，或无更新横幅时的真实失败） / `3`=未找到 WorkBuddy 窗口 / `4`=更新重启中（已点「重启升级」但 180s 内未等到新窗口，脚本已写 `checkin_state.json` 续签标记，需外部定时任务在更新完成后接管续签）。
 
 结果截图保存在脚本同目录 `checkin_result.png`，可用于人工确认或后续通知。
+
+## 失败兜底与更新续签（2026-08-17 老板需求）
+
+签到失败时脚本自动检查是否「更新横幅作祟」，是则完成更新并**继续签到**（最多 3 轮）：
+
+```
+attempt_checkin()  ← 单轮签到(前置横幅检测 + 头像→加油站→领取→灰度校验)
+        │
+        ├─ 成功 → 清除 checkin_state.json → 退出码 0
+        │
+        └─ 失败 → 截图 detect_update_overlay()
+                     │
+                     ├─ 检测到绿色[重启升级] → announce_move + click → mark_pending()
+                     │       → 等应用重启(最长 180s, wait_for_new_window)
+                     │             ├─ 新窗口出现 → 绑定 _target → 下一轮继续签到
+                     │             └─ 超时      → 退出码 4 (checkin_state.json 留续签标记)
+                     │
+                     └─ 无横幅 → 真实失败 → 退出码 2
+```
+
+- **续签标记**：`scripts/checkin_state.json`（`{"pending": true, "reason": "...", "ts": "..."}`）。签到成功自动清除；应用更新重启中由脚本写入，供续签流程读取判断。
+- **续签载体 = Windows 计划任务（关键，2026-08-17 老板质疑后修复）**：WorkBuddy 重启时，运行在它进程内的 agent 会话会**连带终止**——「等几分钟重跑」这类会话内逻辑不可靠。正确做法：脚本点「重启升级」后先 `schedule_resume_task()` 用 `schtasks /create` 注册 **8 分钟后**的 `-resume` 计划任务（`python wb_mouse_checkin.py -resume`）。该任务**独立于 WorkBuddy 进程**，重启不影响它；到点由独立 python 进程唤醒，`do_resume()` 检查续签标记 → 等 WorkBuddy 窗口出现（最长 600s）→ `attempt_checkin()` 补签 → 成功则清标记 + `cancel_resume_task()` 删任务。
+- **双保险**：脚本点更新后本进程若还活着，会先自己等重启 180s 并续签（此时顺手删掉计划任务，避免重复）；只有等不到（进程随重启被杀）才靠计划任务兜底。
+- **注意**：点「重启升级」后 WorkBuddy 会退出并重装新版本，旧窗口句柄失效；脚本用 `wait_for_new_window()`（轮询重新枚举）等新窗口，绑定后继续签到。
 
 ## 关键实现要点（避免重踩坑）
 
@@ -88,6 +137,13 @@ python scripts/wb_mouse_checkin.py -calibrate
     - **`announce_move()`**：点头像前鼠标「飞向目标 → 移开右上角 → 飞回目标」两次可见位移（各停 0.5s），用户看到鼠标自己动就知道脚本要操作了，提前松手。
     - **`click_at()` 点击前停顿 0.4s**：`SetCursorPos` 后多留反应时间。
     - 调用顺序：`wait_mouse_idle()` → `focus()` → `announce_move(sa,...)` → `click_at(*sa,...)`
+12. **更新提示（底部横幅）遮住头像自动处理（2026-08-17）**：WorkBuddy 有新版本时会弹出**横跨客户区底部的白色横幅**（左侧升级图标 + 文案"新版本就绪" + **绿色按钮「重启升级」** + 白色按钮「更新日志」 + 右侧 ×），横幅会**盖住左下角头像** → 脚本点头像实际点到横幅上 → 账户菜单不弹出 → 后续全错位 → 签到失败。老板 2026-08-17 提供实测截图确认形态。
+    - **检测**：`focus()` 后、点头像前先截 `checkin_pre.png`；在客户区**底部 85%~100%** 区域扫描 **teal 色像素**（实测按钮 avgRGB=(95,208,169)，判定 `g>=150 and g-r>=40 and b>=90 and r<=180`），找最大 60px 簇（≥ 80 采样点）。teal 是品牌青绿，普通灰色 UI（g-r≈0）天然不命中，误判率低。
+    - **处理**：检测到即 `announce_move + click_at` 点击（点的就是绿色「重启升级」，**不是**白色「更新日志」）；然后轮询 3s 间隔：
+      - 旧窗口句柄 `IsWindow()` 失效（应用重启升级中）→ `wait_for_new_window`（最长 60s）找新窗口 → 重新绑定 `_target` → `'restarted'`，重新 focus + 截图确认无横幅后继续签到。
+      - 横幅消失（`detect_update_overlay` 返回 None）→ `'done'`，重新 `focus + recompute_geometry` 后继续签到。
+      - 超时 120s 仍异常 → 失败退出（避免定时任务长期卡住）。
+    - **验证**：用 `checkin_after_ctrlw.png` 实测，检测中心 (333,1132) vs 按钮实际中心 (309,1141)，偏差 24px，落在按钮内部。
 
 ## 配置定时任务（示例）
 
