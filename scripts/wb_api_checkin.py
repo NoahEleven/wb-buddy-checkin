@@ -22,7 +22,7 @@
 # 【隐私说明】仅读取本机登录态并调用官方接口, 凭据不落盘不外发。
 # ============================================================================
 
-import json, os, sys, urllib.request, urllib.error
+import glob, json, os, sys, urllib.request, urllib.error
 
 # WorkBuddy 桌面端登录态文件(2026-08-18 逆向定位: sharedDataPath/auth/<id>.info)
 AUTH_FILE = os.path.join(os.path.expanduser("~"), "AppData", "Local",
@@ -35,30 +35,86 @@ AUTH_FILE_FALLBACK = os.path.join(os.path.expanduser("~"), "AppData", "Local",
 # 后端 host(逆向自 app.asar: getFullUrl = window.location.origin + path,
 # 前端 origin = https://copilot.tencent.com, 已验证可通)
 BASE = "https://copilot.tencent.com"
+# v2 新端点(2026-09-29 实测, 与 totorosir-workbuddy-score 同源):
+#   域名取登录态 auth.domain(缺省 www.codebuddy.cn), 数据比旧端点真实
+#   (旧端点在活动期外会返回 连续0/激活False 的假数据, 已签状态也可能不准)
+BASE_V2 = "https://www.codebuddy.cn"
+STATUS_PATH_V2 = "/v2/billing/meter/checkin-activity-status"
+CHECKIN_PATH_V2 = "/v2/billing/meter/daily-checkin"
 TIMEOUT = 20
 # 服务端按 UA 区分请求来源, 非浏览器 UA 直接裸 400(2026-08-18 实测坑), 必须带浏览器 UA
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
+# ----------------------------------------------------------------------------
+# 5.6.2+ 加密登录态兼容(2026-09-29 新增):
+#   新版 WorkBuddy 把 auth.accessToken 改为 AES-256-GCM 信封 {"$wbEncrypted":1,...},
+#   静态钥 atRestSecretKey 运行时驻留 WorkBuddy.exe 进程内存(磁盘无明文),
+#   需多级密钥发现(环境变量->密钥文件->DPAPI/进程内存扫描->CDP)才能解密。
+#   本脚本不重复造轮子, 复用市场 skill totorosir-workbuddy-score 的解密引擎
+#   (buddy_station.load_credentials, MIT-0): import 失败/未安装时明确报错 exit 2,
+#   由调用方回退 GUI 兜底方案, 行为与旧版"无登录态"一致。
+# ----------------------------------------------------------------------------
+_bs_mod = None  # 缓存已加载的 buddy_station 模块
+
+
+def _load_decrypt_engine():
+    """尝试 import totorosir-workbuddy-score 的 buddy_station 作解密引擎。"""
+    global _bs_mod
+    if _bs_mod is not None:
+        return _bs_mod
+    candidates = glob.glob(os.path.join(
+        os.path.expanduser("~"), ".workbuddy", "skills",
+        "totorosir-workbuddy-score*", "scripts"))
+    if not candidates:
+        print("[auth] 未找到解密引擎(totorosir-workbuddy-score skill 未安装), "
+              "无法解密 5.6.2+ 加密登录态。")
+        _bs_mod = False
+        return _bs_mod
+    sys.path.insert(0, candidates[0])
+    try:
+        import buddy_station  # noqa: PLC0415
+        _bs_mod = buddy_station
+    except Exception as e:
+        print(f"[auth] 解密引擎 import 失败: {e}")
+        _bs_mod = False
+    return _bs_mod
+
 
 def get_token():
-    """读登录态文件拿 accessToken。返回 (token, 来源路径) 或 (None, None)。"""
+    """读登录态文件拿 accessToken, 自动识别明文/5.6.2+ 加密信封。
+    返回 (token, 来源路径) 或 (None, None)。"""
     for path in (AUTH_FILE, AUTH_FILE_FALLBACK):
-        if os.path.exists(path):
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, encoding="utf-8") as fh:
+                d = json.load(fh)
+        except Exception:
+            continue
+        t = (d.get("auth") or {}).get("accessToken")
+        if not t:
+            continue
+        if isinstance(t, str):          # 明文 JWT(旧客户端)
+            return t, path
+        if isinstance(t, dict) and t.get("$wbEncrypted"):  # 5.6.2+ 信封
+            eng = _load_decrypt_engine()
+            if not eng:
+                return None, None
             try:
-                d = json.load(open(path, encoding="utf-8"))
-                t = (d.get("auth") or {}).get("accessToken")
-                if t:
-                    return t, path
-            except Exception:
-                pass
+                token, _domain = eng.load_credentials(path)
+                print("[auth] 加密登录态已解密(5.6.2+ 兼容引擎)。")
+                return token, path
+            except Exception as e:
+                print(f"[auth] 加密登录态解密失败: {e}")
+                return None, None
     return None, None
 
 
-def call(path, token, body=None):
+def call(path, token, body=None, base=None):
     """POST 官方接口。返回解析后的 JSON dict(含 HTTPError 时读 body 业务码)。"""
     req = urllib.request.Request(
-        BASE + path,
+        (base or BASE) + path,
         data=json.dumps(body or {}).encode(),
         headers={"Content-Type": "application/json",
                  "Authorization": "Bearer " + token,
@@ -82,21 +138,29 @@ def main():
     status_only = "-status" in sys.argv
     token, src = get_token()
     if not token:
-        print("ERROR: 未找到 WorkBuddy 登录态(auth 文件缺失或无 accessToken)。")
+        print("ERROR: 未取得可用 accessToken(登录态缺失, 或 5.6.2+ 加密且解密引擎不可用)。")
         print(f"  查找路径: {AUTH_FILE}")
-        print("  请确认 WorkBuddy 桌面端已登录后重试。")
+        print("  请确认 WorkBuddy 桌面端已登录; 仍失败请回退 GUI 兜底方案。")
         return 2
     print(f"[auth] 登录态: {src}")
 
-    st = call("/billing/meter/checkin-status", token)
+    # 优先 v2 新端点(真实数据), 失败回退旧端点
+    st = call(STATUS_PATH_V2, token, base=BASE_V2)
+    use_v2 = st.get("code") == 0
+    if not use_v2:
+        print(f"[status] v2 端点不可用({st.get('msg', st.get('code'))}), 回退旧端点...")
+        st = call("/billing/meter/checkin-status", token)
     if st.get("code") != 0:
         print(f"[status] 查询签到状态失败: {st}")
         return 2
     data = st.get("data") or {}
     today_checked = bool(data.get("today_checked_in"))
     streak = data.get("streak_days") or 0
+    total = data.get("total_credits")
+    total_s = f" | 总积分: {total}" if total is not None else ""
     print(f"[status] 今日已签: {today_checked} | 连续天数: {streak} | "
-          f"今日积分: {data.get('today_credit') or 0} | 活动激活: {data.get('active')}")
+          f"今日积分: {data.get('today_credit') or 0}{total_s} | "
+          f"端点: {'v2' if use_v2 else 'legacy'}")
 
     if today_checked:
         print("== 结论: 今日已签到, 无需领取 ==")
@@ -106,7 +170,8 @@ def main():
         return 0
 
     print("[checkin] 今日未签到, 调用 daily-checkin 领取...")
-    r = call("/billing/meter/daily-checkin", token)
+    r = (call(CHECKIN_PATH_V2, token, base=BASE_V2) if use_v2
+         else call("/billing/meter/daily-checkin", token))
     code = r.get("code")
     if code == 0:
         d2 = r.get("data") or {}

@@ -1,13 +1,14 @@
 ---
 name: wb-buddy-checkin
-description: 自动完成 WorkBuddy 桌面客户端「Buddy 加油站」每日签到、领取积分。当用户需要在 Windows 上自动点击头像→Buddy加油站→立即领取，并通过截图灰度校验是否成功（灰底「今日已领」）时使用。基于纯 ctypes 实现窗口置前、坐标点击与窗口截图，零第三方 Python 依赖，仅依赖 Windows 系统 API（可选复用 desktop-control-win skill 的截图）。
+description: 自动完成 WorkBuddy 桌面客户端「Buddy 加油站」每日签到与「派猫猫旅行」积分领取。API 直连方案（推荐）：读本机登录态直调官方接口，兼容 5.6.2+ 加密登录态（AES-256-GCM 信封自动解密）；GUI 坐标点击方案兜底（纯 ctypes 窗口置前 + 坐标点击 + 截图灰度校验，零第三方依赖）。猫猫旅行支持只读状态展示与先领后派全自动闭环（写操作需显式 --auto）。
 agent_created: true
 ---
 
-# wb-buddy-checkin —— WorkBuddy 每日签到
+# wb-buddy-checkin —— WorkBuddy 每日签到 + 猫猫旅行
 
-在 Windows 上自动给 WorkBuddy 桌面客户端的「Buddy 加油站」签到领积分（每日 100 积分）。
-脚本用相对坐标点击 + 截图灰度校验，无需 OCR，主题无关（亮/暗色都能正确判定）。
+在 Windows 上自动完成 WorkBuddy「Buddy 加油站」每日签到（每日 100 积分）与「派猫猫旅行」闭环（每日 5-10 积分额外收益）。
+
+**推荐执行顺序（2026-09-29 定稿）**：API 直连（秒级）→ 旅行 `--auto` 闭环 → 仅当 API 失败（exit 2）才回退 GUI 坐标点击。
 
 ## 何时使用
 
@@ -53,26 +54,45 @@ python scripts/wb_mouse_checkin.py -run
 
 脚本位于 `scripts/`，**两套方案**：
 
-### 方案 A：API 直连（推荐，2026-08-18 新增）
+### 方案 A：API 直连（推荐，2026-08-18 新增 / 2026-09-29 升级）
 
 零 GUI 依赖，无窗口位置/DPI/更新横幅遮挡问题。读本地登录态直调官方接口：
 
 ```bash
-# 查询状态 + 未签则领取（幂等）
+# 查询状态 + 未签则领取（幂等）；优先 v2 端点（真实积分数据），失败自动回退旧端点
 python scripts/wb_api_checkin.py
 
 # 仅查询，不领取
 python scripts/wb_api_checkin.py -status
 ```
 
-退出码：`0`=成功/已签到 / `2`=失败（无登录态/接口异常）。
+退出码：`0`=成功/已签到 / `2`=失败（无登录态/解密不可用/接口异常）。
 
-**原理**（2026-08-18 逆向自 app.asar + 实测验证）：
-- 登录态文件：`%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info`（明文 JSON，`auth.accessToken` 为 JWT；同一账号体系，WorkBuddy/CodeBuddy 通用）
-- 后端 host：`https://copilot.tencent.com`（前端 origin，`getFullUrl = window.location.origin + path`）
-- 接口：`POST /billing/meter/checkin-status`（查询）、`POST /billing/meter/daily-checkin`（领取，幂等，已签返回 code 10001「今天已签到，请明天再来」）
-- 认证：`Authorization: Bearer <accessToken>`；**必须带浏览器 User-Agent**，否则服务端裸 400（2026-08-18 实测坑）
-- 接口调用方式与 SkillHub workbuddy-checkin / workbuddy-daily-checkin 同款（官方路径社区也已证实）
+**原理**（2026-08-18 逆向自 app.asar + 实测验证；2026-09-29 兼容升级）：
+- 登录态文件：`%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info`（JSON；同一账号体系，WorkBuddy/CodeBuddy 通用）
+- **5.6.2+ 加密登录态兼容（2026-09-29）**：新版把 `auth.accessToken` 改为 AES-256-GCM 信封 `{"$wbEncrypted":1,...}`，静态钥运行时驻留 WorkBuddy.exe 进程内存（磁盘无明文）。本脚本复用市场 skill **totorosir-workbuddy-score** 的解密引擎（`buddy_station.load_credentials`，MIT-0，密钥发现：环境变量→密钥文件→DPAPI/进程内存扫描→CDP），import 失败或未安装时明确报错 exit 2，由调用方回退 GUI。
+- 端点（双端点，v2 优先）：
+  - v2（数据真实）：`POST https://www.codebuddy.cn/v2/billing/meter/checkin-activity-status`（查询）、`POST /v2/billing/meter/daily-checkin`（领取，幂等）
+  - legacy 回退：`POST https://copilot.tencent.com/billing/meter/checkin-status`、`POST /billing/meter/daily-checkin`（活动期外会返回 连续0/激活False 假数据，仅兜底）
+- 认证：`Authorization: Bearer <accessToken>`；**billing 接口必须带浏览器 User-Agent**，否则服务端裸 400（2026-08-18 实测坑；travel 接口不校验 UA）
+
+### 方案 A+：派猫猫旅行闭环（2026-09-29 新增）
+
+```bash
+# 只读状态展示（默认）：空闲/旅行中(倒计时)/已到达(可领积分)
+python scripts/wb_travel.py
+
+# 全自动闭环（写操作，先领后派）：arrived 则领取 → 重查 → idle 且未达每日上限则派出
+python scripts/wb_travel.py --auto
+
+# 指定派遣地点（1=咖啡馆 2=商场店铺 3=健身房 4=古镇客栈；缺省随机，收益无差异）
+python scripts/wb_travel.py --auto --location 1
+
+# 机器可读 JSON
+python scripts/wb_travel.py --json
+```
+
+退出码：`0`=成功 / `2`=失败。**安全约束**：写操作仅 `--auto` 显式触发；派出前必查 `daily_limit_reached`，达上限绝不发写请求；到达后状态保持 `arrived` 不丢积分，下次运行自动补领。接口 host `https://www.workbuddy.cn`（不带 `/v2` 前缀），仅需 Bearer Token。
 
 ### 方案 B：GUI 坐标点击（原方案，兜底）
 
@@ -90,7 +110,7 @@ python scripts/wb_mouse_checkin.py -calibrate-gui
 python scripts/wb_mouse_checkin.py -calibrate
 ```
 
-**推荐组合**：每日任务先跑方案 A（API，稳、快），退出码 2 时回退方案 B（GUI 点击，覆盖登录态异常场景）。
+**推荐组合**（2026-09-29 定稿）：每日任务先跑方案 A（API，稳、快、秒级）+ 方案 A+（`wb_travel.py --auto` 旅行闭环）；API exit 2 时才回退方案 B（GUI 点击，覆盖登录态异常场景）。
 
 退出码：`0`=成功（已处于「今日已领」） / `2`=失败（未领取、面板异常，或无更新横幅时的真实失败） / `3`=未找到 WorkBuddy 窗口 / `4`=更新重启中（已点「重启升级」但 180s 内未等到新窗口，脚本已写 `checkin_state.json` 续签标记，需外部定时任务在更新完成后接管续签）。
 
